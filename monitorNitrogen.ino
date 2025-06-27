@@ -1,224 +1,230 @@
-#include <SoftwareSerial.h>
-#include <Wire.h> 
+// =================================================================
+// ==      ESP32 AUTOMATIC WATER PURITY CONTROLLER (DUAL SENSOR)  ==
+// =================================================================
+// This script uses Sensor 1 as the primary control and Sensor 2 for monitoring.
+//
+// LOGIC (based on Sensor 1):
+// - If TDS > 300 PPM (Impure):         Activate Motor 1.
+// - If 31 <= TDS <= 300 PPM (Pure):    Activate Motor 2.
+// - If TDS <= 30 PPM (No Water/Empty): Do nothing.
+//
 
-// --- Pin Definitions ---
-// Relays for Motors
-const int RELAY_PIN_1 = 12; // Pin for the first motor's relay
-const int RELAY_PIN_2 = 11; // Pin for the second motor's relay
+// --- Hardware Pin Definitions ---
+const int TDS_PIN_1   = 34; // GPIO34 - PRIMARY CONTROL SENSOR for decision making
+const int TDS_PIN_2   = 35; // GPIO35 - MONITORING SENSOR for additional data
+const int RELAY_PIN_1 = 25; // Relay for Motor 1 (Impure Water Pump)
+const int RELAY_PIN_2 = 26; // Relay for Motor 2 (Pure Water Pump)
 
-// RS485 Module Control Pins (for NPK Sensor)
-#define RE 8 // Receiver Enable Pin
-#define DE 7 // Driver Enable Pin
+// --- Logic & Control Constants ---
+const int IMPURE_THRESHOLD   = 300;  // PPM value above which water is "impure"
+const int NO_WATER_THRESHOLD = 30;   // PPM value below which we assume no water / tank empty
+const int MOTOR_RUN_TIME     = 5000; // How long to run the motor (in milliseconds)
+const int CHECK_INTERVAL     = 10000; // How often to evaluate water purity (in milliseconds)
 
-// SoftwareSerial Pins for RS485 Module (RX, TX)
-// Use pins 2, 3 for Uno/Nano etc.
-SoftwareSerial mod(2, 3);
-// If using Mega, you might use HardwareSerial or different pins:
-// SoftwareSerial mod(10, 11); // Conflicts with RELAY_PIN_2 if set to 11!
+// --- TDS Measurement Constants ---
+#define VREF           3.3      // ESP32 ADC reference voltage is 3.3V
+#define ADC_RESOLUTION 4095.0   // ESP32 ADC is 12-bit (0-4095)
+#define SCOUNT         30       // Number of samples to take for a stable reading (median filter)
 
-// --- NPK Sensor Settings ---
-// Modbus RTU requests for reading NPK values
-const byte nitro[] = {0x01, 0x03, 0x00, 0x1e, 0x00, 0x01, 0xe4, 0x0c}; // Request Nitrogen
-const byte phos[]  = {0x01, 0x03, 0x00, 0x1f, 0x00, 0x01, 0xb5, 0xcc}; // Request Phosphorus
-const byte pota[]  = {0x01, 0x03, 0x00, 0x20, 0x00, 0x01, 0x85, 0xc0}; // Request Potassium
+// --- Data Structure for a Sensor ---
+struct TdsSensor {
+  const byte pin;               // The GPIO pin the sensor is connected to
+  int analogBuffer[SCOUNT];     // Array to store raw sensor readings for filtering
+  int analogBufferIndex;        // Current position/index in the analog buffer
+};
 
-// Buffer to store Modbus response data
-byte values[11]; // Needs to be large enough for expected response
+// --- Global Variables ---
+TdsSensor sensor1 = {TDS_PIN_1};
+TdsSensor sensor2 = {TDS_PIN_2};
 
-// --- Control Logic Settings ---
-const int NITROGEN_THRESHOLD = 1.0; 
+// Assumed water temperature for TDS compensation.
+float temperature = 25.0;
 
-const unsigned long MOTOR_ON_DURATION = 10000; // 10 seconds in milliseconds
-const unsigned long WAIT_BETWEEN_MOTORS = 60000; // 1 minute in milliseconds
-const unsigned long MONITORING_DELAY = 5000;   // Check sensor every 5 seconds when idle
-
-// ================= SETUP =================
+// =================================================================
+// ==                          SETUP                              ==
+// =================================================================
 void setup() {
-  // Initialize Serial Monitor for debugging
-  Serial.begin(9600);
-  Serial.println("Starting Integrated Control System...");
+  // Initialize serial communication to send data to the Serial Monitor.
+  Serial.begin(115200);
+  Serial.println("\n--- Dual Sensor Water Purity Controller Initialized ---");
 
-  // Initialize SoftwareSerial for NPK Sensor
-  mod.begin(9600);
-
-  // Initialize Relay Pins
+  // Set the relay pins as outputs to control the motors.
   pinMode(RELAY_PIN_1, OUTPUT);
   pinMode(RELAY_PIN_2, OUTPUT);
-  // Ensure motors start OFF (assuming Active HIGH relays)
+
+  // Ensure both motors are OFF at startup for safety.
   digitalWrite(RELAY_PIN_1, LOW);
-  digitalWrite(RELAY_PIN_2, LOW);
-  Serial.println("Relay pins initialized.");
-
-  // Initialize RS485 Control Pins
-  pinMode(RE, OUTPUT);
-  pinMode(DE, OUTPUT);
-  // Set RS485 initially to receiving mode
-  digitalWrite(DE, LOW);
-  digitalWrite(RE, LOW);
-  Serial.println("RS485 pins initialized.");
-
-  delay(500); // Allow time for components to stabilize
-  Serial.println("Setup complete. Entering main loop.");
+  digitalWrite(RELAY_PIN_2, LOW); 
 }
 
-// ================= LOOP =================
+
+// =================================================================
+// ==                           LOOP                              ==
+// =================================================================
 void loop() {
-  // 1. Read Nitrogen Value
-  int currentNitrogen = nitrogen(); // Read from sensor
-  delay(250); // Short delay between Modbus commands as in original code
+  // from BOTH sensors every 40 milliseconds for real-time data collection.
+  static unsigned long analogSampleTimepoint = millis();
+  if (millis() - analogSampleTimepoint > 40U) {
+    analogSampleTimepoint = millis();
 
-  // Optional: Read P and K if needed for logging, but they don't affect motor control here
-  // int currentPhos = phosphorous();
-  // delay(250);
-  // int currentPota = potassium();
-  // delay(250);
+    // Sample Sensor 1 and store the reading in its buffer.
+    sensor1.analogBuffer[sensor1.analogBufferIndex++] = analogRead(sensor1.pin);
+    if (sensor1.analogBufferIndex == SCOUNT) {
+      sensor1.analogBufferIndex = 0; 
+    }
 
-  // 2. Print current Nitrogen value
-  Serial.print("Current Nitrogen: ");
-  Serial.print(currentNitrogen);
-  Serial.println(" mg/kg");
-
-  // 3. Check Nitrogen Level and Control Motors
-  if (currentNitrogen > NITROGEN_THRESHOLD) {
-    Serial.println("Nitrogen level HIGH. Activating motor sequence.");
-
-    // --- Motor 1 Sequence ---
-    Serial.println("Turning Motor 1 ON");
-    digitalWrite(RELAY_PIN_1, HIGH); // Turn Motor 1 ON (use LOW if Active LOW relay)
-    delay(MOTOR_ON_DURATION);        // Keep it ON for 10 seconds
-    Serial.println("Turning Motor 1 OFF");
-    digitalWrite(RELAY_PIN_1, LOW);  // Turn Motor 1 OFF (use HIGH if Active LOW relay)
-
-    // --- Wait between Motors ---
-    Serial.println("Waiting for 1 minute...");
-    delay(WAIT_BETWEEN_MOTORS);     // Wait for 1 minute
-
-    // --- Motor 2 Sequence ---
-    Serial.println("Turning Motor 2 ON");
-    digitalWrite(RELAY_PIN_2, HIGH); // Turn Motor 2 ON (use LOW if Active LOW relay)
-    delay(MOTOR_ON_DURATION);        // Keep it ON for 10 seconds
-    Serial.println("Turning Motor 2 OFF");
-    digitalWrite(RELAY_PIN_2, LOW);  // Turn Motor 2 OFF (use HIGH if Active LOW relay)
-
-    Serial.println("Motor sequence complete. Re-checking Nitrogen level soon.");
-    // Loop will automatically restart and check Nitrogen again immediately
-
-  } else {
-    // Nitrogen level is OK
-    Serial.println("Nitrogen level OK. Monitoring...");
-    // Ensure motors are definitely off (safety check)
-    digitalWrite(RELAY_PIN_1, LOW);
-    digitalWrite(RELAY_PIN_2, LOW);
-
-    // Wait before checking the sensor again
-    delay(MONITORING_DELAY);
-  }
-}
-
-// ================= NPK Sensor Reading Functions =================
-
-// Function to read Nitrogen value
-int nitrogen() {
-  // Set RS485 to transmit mode
-  digitalWrite(DE, HIGH);
-  digitalWrite(RE, HIGH);
-  delay(10); // Allow time for mode change
-
-  // Send Modbus request for Nitrogen
-  mod.write(nitro, sizeof(nitro));
-
-  // Set RS485 back to receive mode
-  digitalWrite(DE, LOW);
-  digitalWrite(RE, LOW);
-
-  // Wait for and read the response (expecting 7 bytes for standard 1-register read response)
-  byte byteCount = 0;
-  unsigned long startTime = millis();
-  while (mod.available() < 7 && (millis() - startTime < 1000)) {
-      // Wait for 7 bytes or timeout after 1 second
-      delay(1); // Small delay to prevent busy-waiting
+    // Sample Sensor 2 and store its reading.
+    sensor2.analogBuffer[sensor2.analogBufferIndex++] = analogRead(sensor2.pin);
+    if (sensor2.analogBufferIndex == SCOUNT) {
+      sensor2.analogBufferIndex = 0;
+    }
   }
 
-  if (mod.available() >= 7) {
-      Serial.print("N Response HEX: ");
-      for (byte i = 0; i < 7; i++) {
-          values[i] = mod.read();
-          // Serial.print(values[i], HEX); // Uncomment for raw HEX debugging
-          // Serial.print(" ");
-      }
-      // Serial.println(); // Uncomment for raw HEX debugging
+  // This is the main control timer. It triggers the purity check and motor logic
+  // at the defined CHECK_INTERVAL (e.g., every 10 seconds).
+  static unsigned long lastCheckTime = 0;
+  if (millis() - lastCheckTime > CHECK_INTERVAL) {
+    lastCheckTime = millis(); // Reset the timer to start the next interval
 
-      // Combine High Byte (values[3]) and Low Byte (values[4]) for the result
-      // Assuming standard Modbus response format: Addr Func ByteCount DataHi DataLo CRCHi CRCLo
-      int result = (values[3] << 8) | values[4];
-      // Basic CRC check placeholder (optional but recommended for robustness)
-      // You would calculate CRC on first 5 bytes and compare with values[5] & values[6]
-      return result;
-  } else {
-      Serial.println("Nitrogen read timeout or insufficient data!");
-      // Flush buffer if partial data received
-      while(mod.available()) { mod.read(); }
-      return -1; // Return -1 or some error code
+    // --- Step 1: Calculate the current TDS values for both sensors ---
+    float controlTdsValue = getCurrentTdsValue(sensor1);    // Value from the primary sensor
+    float monitoringTdsValue = getCurrentTdsValue(sensor2); // Value from the secondary sensor
+
+    Serial.println("\n-------------------------------------------------");
+    Serial.print("Checking water... (Cycle every ");
+    Serial.print(CHECK_INTERVAL / 1000);
+    Serial.println(" seconds)");
+
+    // Print the TDS value from the primary control sensor.
+    Serial.print("  - Control Sensor (Pin ");
+    Serial.print(sensor1.pin);
+    Serial.print(") TDS: ");
+    Serial.print(controlTdsValue, 0); 
+    Serial.println(" ppm");
+
+    // Print the TDS value from the secondary monitoring sensor.
+    Serial.print("  - Monitoring Sensor (Pin ");
+    Serial.print(sensor2.pin);
+    Serial.print(") TDS: ");
+    Serial.print(monitoringTdsValue, 0);
+    Serial.println(" ppm");
+
+    // --- Step 2: Decide what to do based on the CONTROL sensor's value ---
+    if (controlTdsValue > IMPURE_THRESHOLD) {
+      Serial.println("  - Result: Water is IMPURE.");
+      runMotor(1, MOTOR_RUN_TIME); // Run Motor 1 (for impure water)
+
+    } else if (controlTdsValue > NO_WATER_THRESHOLD) {
+      Serial.println("  - Result: Water is PURE.");
+      runMotor(2, MOTOR_RUN_TIME); // Run Motor 2 (for pure water)
+
+    } else {
+      Serial.println("  - Result: No water detected or very low TDS.");
+      Serial.println("  - Action: Doing nothing."); // Stay idle if no water
+    }
   }
 }
 
 
-// Function to read Phosphorus value (similar structure to nitrogen)
-int phosphorous() {
-  digitalWrite(DE, HIGH);
-  digitalWrite(RE, HIGH);
-  delay(10);
-  mod.write(phos, sizeof(phos));
-  digitalWrite(DE, LOW);
-  digitalWrite(RE, LOW);
+// =================================================================
+// ==                      HELPER FUNCTIONS                       ==
+// =================================================================
 
-  byte byteCount = 0;
-  unsigned long startTime = millis();
-   while (mod.available() < 7 && (millis() - startTime < 1000)) { delay(1); }
+/**
+ * @brief Activates a specified motor's relay for a given duration.
+ * Prints action messages to the Serial Monitor.
+ *
+ * @param motorNumber The motor to operate (1 for Motor 1, 2 for Motor 2).
+ * @param duration The time in milliseconds the motor should run.
+ */
+void runMotor(int motorNumber, int duration) {
+  // Determine which relay pin corresponds to the requested motor.
+  int relayPin = (motorNumber == 1) ? RELAY_PIN_1 : RELAY_PIN_2;
 
-  if (mod.available() >= 7) {
-      Serial.print("P Response HEX: ");
-      for (byte i = 0; i < 7; i++) {
-          values[i] = mod.read();
-          // Serial.print(values[i], HEX); // Uncomment for raw HEX debugging
-          // Serial.print(" ");
-      }
-      // Serial.println(); // Uncomment for raw HEX debugging
-      int result = (values[3] << 8) | values[4];
-      return result;
-  } else {
-       Serial.println("Phosphorus read timeout or insufficient data!");
-       while(mod.available()) { mod.read(); }
-       return -1;
-  }
+  Serial.print("  - Action: Running Motor ");
+  Serial.print(motorNumber);
+  Serial.print(" for ");
+  Serial.print(duration / 1000); // Convert milliseconds to seconds for display
+  Serial.println(" seconds...");
+
+  // Activate the relay to turn the motor ON.
+  digitalWrite(relayPin, HIGH);
+  delay(duration); 
+
+  // Deactivate the relay to turn the motor OFF.
+  digitalWrite(relayPin, LOW);
+
+  Serial.print("  - Action complete. Motor ");
+  Serial.print(motorNumber);
+  Serial.println(" OFF.");
 }
 
-// Function to read Potassium value (similar structure to nitrogen)
-int potassium() {
-  digitalWrite(DE, HIGH);
-  digitalWrite(RE, HIGH);
-  delay(10);
-  mod.write(pota, sizeof(pota));
-  digitalWrite(DE, LOW);
-  digitalWrite(RE, LOW);
+/**
+ * @brief Calculates the TDS value (in PPM) for a given sensor object.
+ * This function applies median filtering, voltage conversion, and temperature compensation.
+ *
+ * @param sensor A reference to the TdsSensor object to process.
+ * @return The calculated TDS value in PPM (float).
+ */
+float getCurrentTdsValue(TdsSensor &sensor) {
+  // Get the median value from the sensor's buffer to filter out noise.
+  // We pass a copy of the buffer to avoid modifying the original during sorting.
+  int medianValue = getMedianNum(sensor.analogBuffer, SCOUNT);
 
-  byte byteCount = 0;
-  unsigned long startTime = millis();
-  while (mod.available() < 7 && (millis() - startTime < 1000)) { delay(1); }
+  // Convert the raw ADC median value to a voltage.
+  float voltage = medianValue * VREF / ADC_RESOLUTION;
 
-  if (mod.available() >= 7) {
-      Serial.print("K Response HEX: ");
-      for (byte i = 0; i < 7; i++) {
-          values[i] = mod.read();
-          // Serial.print(values[i], HEX); // Uncomment for raw HEX debugging
-          // Serial.print(" ");
+  // Calculate the temperature compensation coefficient.
+  float compensationCoefficient = 1.0 + 0.02 * (temperature - 25.0);
+
+  // Apply temperature compensation to the voltage.
+  float compensationVoltage = voltage / compensationCoefficient;
+
+  // Convert the compensated voltage into a TDS value (PPM) using the sensor's formula.
+  float currentTdsValue = (133.42 * compensationVoltage * compensationVoltage * compensationVoltage -
+                           255.86 * compensationVoltage * compensationVoltage +
+                           857.39 * compensationVoltage) * 0.5;
+
+  return currentTdsValue;
+}
+
+/**
+ * @brief Implements a median filtering algorithm.
+ * Sorts an array of integers and returns the median value. This is highly effective
+ * for reducing random noise in sensor readings.
+ *
+ * @param bArray The array of integer readings to filter.
+ * @param iFilterLen The number of elements in the array.
+ * @return The median value of the array.
+ */
+int getMedianNum(int bArray[], int iFilterLen) {
+  // Create a temporary array to store a copy of the input array.
+  // This ensures the original sensor buffer is not sorted.
+  int bTab[iFilterLen];
+  for (byte i = 0; i < iFilterLen; i++) {
+    bTab[i] = bArray[i];
+  }
+
+  // Bubble sort algorithm to sort the temporary array.
+  int i, j, bTemp;
+  for (j = 0; j < iFilterLen - 1; j++) {
+    for (i = 0; i < iFilterLen - j - 1; i++) {
+      if (bTab[i] > bTab[i + 1]) {
+        // Swap elements if they are in the wrong order.
+        bTemp = bTab[i];
+        bTab[i] = bTab[i + 1];
+        bTab[i + 1] = bTemp;
       }
-      // Serial.println(); // Uncomment for raw HEX debugging
-      int result = (values[3] << 8) | values[4];
-      return result;
-  } else {
-      Serial.println("Potassium read timeout or insufficient data!");
-      while(mod.available()) { mod.read(); }
-      return -1;
+    }
+  }
+
+  // Determine the median:
+  // If the array length is odd, the median is the middle element.
+  if ((iFilterLen & 1) > 0) { // Equivalent to iFilterLen % 2 != 0
+    return bTab[(iFilterLen - 1) / 2];
+  }
+  // If the array length is even, the median is the average of the two middle elements.
+  else {
+    return (bTab[iFilterLen / 2] + bTab[iFilterLen / 2 - 1]) / 2;
   }
 }
